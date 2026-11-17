@@ -17,9 +17,11 @@ from xml.dom import minidom
 
 try:
     from curl_cffi import requests
+
     HAVE_CURL_CFFI = True
 except ImportError:
     import requests  # type: ignore[no-redef]
+
     HAVE_CURL_CFFI = False
 
 OPENAIP_AIRSPACES_URL = "https://api.core.openaip.net/api/airspaces"
@@ -129,7 +131,7 @@ class ElevationResolver:
                     raise ValueError("Unexpected elevation array length from DEM API.")
                 for key, elev in zip(chunk, elevations):
                     self._cache[key] = float(elev) if elev is not None else 0.0
-            except Exception as exc:
+            except (OSError, ValueError) as exc:
                 if not self._warned:
                     print(
                         f"Warning: DEM elevation lookup failed ({exc}). Falling back to 0 m.",
@@ -166,7 +168,7 @@ def resolve_location(location_str: str) -> tuple[float, float, str, str]:
     """Parse 'lat,lon' coordinates or geocode a place name via Nominatim, returning (lat, lon, label, country_code)."""
     headers = {"User-Agent": "ParaglidingAirspaceKML/1.1"}
     coord_match = re.match(
-        r"^\s*([+-]?\d+(?:\.\d+)?)\s*[,;\s]\s*([+-]?\d+(?:\.\d+)?)\s*$",
+        r"^\s*([+-]?\d+(?:\.\d+)?)(?:\s*[,;]\s*|\s+)([+-]?\d+(?:\.\d+)?)\s*$",
         location_str,
     )
     if coord_match:
@@ -181,13 +183,17 @@ def resolve_location(location_str: str) -> tuple[float, float, str, str]:
                 timeout=10,
             )
             if r.status_code == 200:
-                country_code = r.json().get("address", {}).get("country_code", "FR").upper()
-        except Exception:
-            pass
+                country_code = (
+                    r.json().get("address", {}).get("country_code", "FR").upper()
+                )
+        except (OSError, ValueError) as exc:
+            print(f"Warning: reverse geocoding failed ({exc}). Defaulting to FR.", file=sys.stderr)
         return lat, lon, f"{lat:.4f}, {lon:.4f}", country_code
 
     params = {"q": location_str, "format": "json", "addressdetails": 1, "limit": 1}
-    response = requests.get(NOMINATIM_SEARCH_URL, params=params, headers=headers, timeout=15)
+    response = requests.get(
+        NOMINATIM_SEARCH_URL, params=params, headers=headers, timeout=15
+    )
     response.raise_for_status()
     results = response.json()
     if not results:
@@ -238,14 +244,11 @@ def is_activatable_airspace(airspace: dict[str, Any]) -> bool:
         oh = hours.get("operatingHours")
         if isinstance(oh, list) and oh:
             # An airspace is H24 if all 7 days of the week are 00:00-00:00 without NOTAM
-            is_h24 = (
-                len(oh) == 7
-                and all(
-                    d.get("startTime") == "00:00"
-                    and d.get("endTime") == "00:00"
-                    and not d.get("byNotam")
-                    for d in oh
-                )
+            is_h24 = len(oh) == 7 and all(
+                d.get("startTime") == "00:00"
+                and d.get("endTime") == "00:00"
+                and not d.get("byNotam")
+                for d in oh
             )
             if not is_h24:
                 return True
@@ -280,7 +283,17 @@ def classify_airspace(
     if icao_class == "E":
         return "BLUE"
 
-    if asp_type in ("RMZ", "TMZ", "ATZ", "MATZ", "HTZ", "TIZ", "TIA", "GLIDING", "SPORT"):
+    if asp_type in (
+        "RMZ",
+        "TMZ",
+        "ATZ",
+        "MATZ",
+        "HTZ",
+        "TIZ",
+        "TIA",
+        "GLIDING",
+        "SPORT",
+    ):
         return "YELLOW"
 
     if asp_type in ("R", "D", "TRA", "TSA", "MTR", "ALERT", "WARNING", "PROTECTED"):
@@ -361,10 +374,12 @@ def fetch_openaip_airspaces(
             try:
                 cached_data = json.loads(c_file.read_text(encoding="utf-8"))
                 all_country_airspaces.extend(cached_data)
-                print(f"Loaded {len(cached_data)} airspaces for country {c_code} from local cache.")
+                print(
+                    f"Loaded {len(cached_data)} airspaces for country {c_code} from local cache."
+                )
                 continue
-            except Exception:
-                pass
+            except (OSError, ValueError) as exc:
+                print(f"Warning: could not read cache file {c_file} ({exc}), re-fetching.", file=sys.stderr)
 
         print(f"Fetching airspaces for country {c_code} from OpenAIP API...")
         country_items: list[dict[str, Any]] = []
@@ -402,22 +417,24 @@ def fetch_openaip_airspaces(
             items = payload.get("items", [])
             country_items.extend(items)
 
-            total_pages = int(payload.get("totalPages", 1))
+            total_pages = payload.get("totalPages", 1)
             if page >= total_pages or not items:
                 break
             page += 1
 
         try:
             c_file.write_text(json.dumps(country_items), encoding="utf-8")
-        except Exception:
-            pass
+        except OSError as exc:
+            print(f"Warning: could not write cache file {c_file} ({exc}).", file=sys.stderr)
 
         print(f"Fetched {len(country_items)} airspaces for country {c_code}.")
         all_country_airspaces.extend(country_items)
 
     # Filter geometrically by radius around (lat, lon)
     filtered = [
-        asp for asp in all_country_airspaces if is_airspace_in_radius(asp, lat, lon, radius_km)
+        asp
+        for asp in all_country_airspaces
+        if is_airspace_in_radius(asp, lat, lon, radius_km)
     ]
     return filtered
 
@@ -529,19 +546,21 @@ def add_3d_volume_to_multigeometry(
     if draw_floor_face:
         poly_floor = ET.SubElement(multi_geo, "Polygon")
         ET.SubElement(poly_floor, "altitudeMode").text = "absolute"
-        outer_floor = ET.SubElement(ET.SubElement(poly_floor, "outerBoundaryIs"), "LinearRing")
+        outer_floor = ET.SubElement(
+            ET.SubElement(poly_floor, "outerBoundaryIs"), "LinearRing"
+        )
         ET.SubElement(outer_floor, "coordinates").text = " ".join(
-            f"{lon},{lat},{round(fl, 1)}"
-            for (lon, lat), fl in zip(ring, floor_amsls)
+            f"{lon},{lat},{round(fl, 1)}" for (lon, lat), fl in zip(ring, floor_amsls)
         )
 
     # 2. Ceiling face
     poly_ceil = ET.SubElement(multi_geo, "Polygon")
     ET.SubElement(poly_ceil, "altitudeMode").text = "absolute"
-    outer_ceil = ET.SubElement(ET.SubElement(poly_ceil, "outerBoundaryIs"), "LinearRing")
+    outer_ceil = ET.SubElement(
+        ET.SubElement(poly_ceil, "outerBoundaryIs"), "LinearRing"
+    )
     ET.SubElement(outer_ceil, "coordinates").text = " ".join(
-        f"{lon},{lat},{round(ce, 1)}"
-        for (lon, lat), ce in zip(ring, safe_ceils)
+        f"{lon},{lat},{round(ce, 1)}" for (lon, lat), ce in zip(ring, safe_ceils)
     )
 
     # 3. Vertical side walls
@@ -565,7 +584,7 @@ def add_3d_volume_to_multigeometry(
 
 def format_amsl_range(values: list[float]) -> str:
     """Format a single altitude or min-max range in meters AMSL."""
-    lo, hi = int(round(min(values))), int(round(max(values)))
+    lo, hi = round(min(values)), round(max(values))
     return f"{lo} m AMSL" if abs(hi - lo) <= 5 else f"~{lo}-{hi} m AMSL"
 
 
@@ -608,7 +627,7 @@ def build_kml(
     ET.SubElement(center_pm, "name").text = f"Point Central : {location_label}"
     ET.SubElement(center_pm, "description").text = (
         f"Coordonnees : {center_lat:.5f}, {center_lon:.5f}<br>"
-        f"Altitude terrain (DEM) : {int(round(center_elev))} m AMSL<br>"
+        f"Altitude terrain (DEM) : {round(center_elev)} m AMSL<br>"
         f"Rayon de recherche : {radius_km:g} km<br>"
         f"Plafond visuel : {int(max_altitude_m)} m AMSL"
     )
@@ -648,20 +667,30 @@ def build_kml(
         if not category:
             continue
 
-        floor_val_m, floor_label, floor_is_agl = parse_vertical_limit(asp.get("lowerLimit"))
-        ceil_val_m, ceil_label, ceil_is_agl = parse_vertical_limit(asp.get("upperLimit"))
+        floor_val_m, floor_label, floor_is_agl = parse_vertical_limit(
+            asp.get("lowerLimit")
+        )
+        ceil_val_m, ceil_label, ceil_is_agl = parse_vertical_limit(
+            asp.get("upperLimit")
+        )
 
         raw_rings = extract_polygon_rings(asp.get("geometry", {}))
         if not raw_rings:
             continue
 
         needs_terrain = (floor_is_agl and floor_val_m > 0) or ceil_is_agl
-        resolved_rings_data: list[tuple[list[tuple[float, float]], list[float], list[float]]] = []
+        resolved_rings_data: list[
+            tuple[list[tuple[float, float]], list[float], list[float]]
+        ] = []
         all_floors_amsl: list[float] = []
         all_raw_ceils_amsl: list[float] = []
 
         for raw_ring in raw_rings:
-            ring = densify_ring(raw_ring, max_segment_km=1.5) if needs_terrain else raw_ring
+            ring = (
+                densify_ring(raw_ring, max_segment_km=1.5)
+                if needs_terrain
+                else raw_ring
+            )
             if ring[0] != ring[-1]:
                 ring = ring + [ring[0]]
 
@@ -687,7 +716,9 @@ def build_kml(
             visual_ceil_amsls = [min(c, max_altitude_m) for c in raw_ceil_amsls]
 
             # Keep ring only if at least part of the volume is below max_altitude_m
-            if min(floor_amsls) >= max_altitude_m or max(visual_ceil_amsls) <= min(floor_amsls):
+            if min(floor_amsls) >= max_altitude_m or max(visual_ceil_amsls) <= min(
+                floor_amsls
+            ):
                 continue
 
             resolved_rings_data.append((ring, floor_amsls, visual_ceil_amsls))
@@ -733,7 +764,7 @@ def build_kml(
         exported_count += 1
 
     # Remove empty folders so the KML tree stays clean
-    for folder in list(category_folders.values()):
+    for folder in category_folders.values():
         if folder.find("Placemark") is None:
             doc.remove(folder)
 
@@ -826,7 +857,9 @@ def main() -> None:
         sys.exit(1)
 
     lat, lon, label, detected_country = resolve_location(args.location)
-    print(f"Target location: {label} ({lat:.5f}, {lon:.5f}) | Radius: {args.radius:g} km")
+    print(
+        f"Target location: {label} ({lat:.5f}, {lon:.5f}) | Radius: {args.radius:g} km"
+    )
 
     countries: list[str] = []
     for c_arg in args.countries:
@@ -844,7 +877,7 @@ def main() -> None:
     elevation_resolver = ElevationResolver(enabled=not args.no_dem)
     excluded_classes = {cls.upper() for cls in args.exclude_classes}
     excluded_types = {t.upper() for t in args.exclude_types}
-    slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", label.lower()).strip("_")
+    slug = re.sub(r"_+", "_", re.sub(r"[^a-zA-Z0-9_-]", "_", label.lower())).strip("_")
     output_path = args.output or f"airspaces_{slug}_{int(args.radius)}km.kml"
 
     count = build_kml(
@@ -865,4 +898,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
