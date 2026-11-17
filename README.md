@@ -40,7 +40,8 @@ Airspace volumes are modeled as closed 3D polyhedra (floor, ceiling, and vertica
 ```bash
 pip install -r requirements.txt
 ```
-*(ou `pip install curl_cffi requests`)*
+
+_(ou `pip install curl_cffi requests`)_
 
 ### 3. Configure Your API Key
 
