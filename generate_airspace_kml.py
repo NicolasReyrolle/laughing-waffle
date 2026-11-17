@@ -16,13 +16,15 @@ from typing import Any
 from xml.dom import minidom
 
 try:
-    from curl_cffi import requests
+    from curl_cffi import requests  # type: ignore[no-redef]
 
-    HAVE_CURL_CFFI = True
+    _curl_cffi_available = True
 except ImportError:
     import requests  # type: ignore[no-redef]
 
-    HAVE_CURL_CFFI = False
+    _curl_cffi_available = False
+
+HAVE_CURL_CFFI: bool = _curl_cffi_available
 
 OPENAIP_AIRSPACES_URL = "https://api.core.openaip.net/api/airspaces"
 NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
