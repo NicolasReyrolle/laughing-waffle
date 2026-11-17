@@ -584,6 +584,8 @@ def add_3d_volume_to_multigeometry(
 
 def format_amsl_range(values: list[float]) -> str:
     """Format a single altitude or min-max range in meters AMSL."""
+    if not values:
+        return "0 m AMSL"
     lo, hi = round(min(values)), round(max(values))
     return f"{lo} m AMSL" if abs(hi - lo) <= 5 else f"~{lo}-{hi} m AMSL"
 
