@@ -105,6 +105,33 @@ class ElevationResolver:
         self._cache: dict[tuple[float, float], float] = {}
         self._warned = False
 
+    def _fetch_elevation_chunk(self, chunk: list[tuple[float, float]]) -> None:
+        """Fetch elevations for one batch and populate the cache."""
+        lats = ",".join(f"{lat:.4f}" for lat, _ in chunk)
+        lons = ",".join(f"{lon:.4f}" for _, lon in chunk)
+        try:
+            resp = requests.get(
+                OPEN_METEO_ELEVATION_URL,
+                params={"latitude": lats, "longitude": lons},
+                headers={"User-Agent": "ParaglidingAirspaceKML/1.1"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            elevations = resp.json().get("elevation", [])
+            if len(elevations) != len(chunk):
+                raise ValueError("Unexpected elevation array length from DEM API.")
+            for key, elev in zip(chunk, elevations):
+                self._cache[key] = float(elev) if elev is not None else 0.0
+        except (OSError, ValueError) as exc:
+            if not self._warned:
+                print(
+                    f"Warning: DEM elevation lookup failed ({exc}). Falling back to 0 m.",
+                    file=sys.stderr,
+                )
+                self._warned = True
+            for key in chunk:
+                self._cache[key] = 0.0
+
     def get_elevations(self, coords: list[tuple[float, float]]) -> list[float]:
         """Return terrain elevations in meters AMSL for a list of (lon, lat) tuples."""
         if not coords or not self.enabled:
@@ -115,31 +142,7 @@ class ElevationResolver:
         missing = list(dict.fromkeys(k for k in keys if k not in self._cache))
 
         for start in range(0, len(missing), self.BATCH_SIZE):
-            chunk = missing[start : start + self.BATCH_SIZE]
-            lats = ",".join(f"{lat:.4f}" for lat, _ in chunk)
-            lons = ",".join(f"{lon:.4f}" for _, lon in chunk)
-            try:
-                resp = requests.get(
-                    OPEN_METEO_ELEVATION_URL,
-                    params={"latitude": lats, "longitude": lons},
-                    headers={"User-Agent": "ParaglidingAirspaceKML/1.1"},
-                    timeout=15,
-                )
-                resp.raise_for_status()
-                elevations = resp.json().get("elevation", [])
-                if len(elevations) != len(chunk):
-                    raise ValueError("Unexpected elevation array length from DEM API.")
-                for key, elev in zip(chunk, elevations):
-                    self._cache[key] = float(elev) if elev is not None else 0.0
-            except (OSError, ValueError) as exc:
-                if not self._warned:
-                    print(
-                        f"Warning: DEM elevation lookup failed ({exc}). Falling back to 0 m.",
-                        file=sys.stderr,
-                    )
-                    self._warned = True
-                for key in chunk:
-                    self._cache[key] = 0.0
+            self._fetch_elevation_chunk(missing[start : start + self.BATCH_SIZE])
 
         return [self._cache[k] for k in keys]
 
@@ -167,13 +170,13 @@ def load_dotenv_file(env_path: str = ".env") -> None:
 def resolve_location(location_str: str) -> tuple[float, float, str, str]:
     """Parse 'lat,lon' coordinates or geocode a place name via Nominatim, returning (lat, lon, label, country_code)."""
     headers = {"User-Agent": "ParaglidingAirspaceKML/1.1"}
-    coord_match = re.match(
-        r"^\s*([+-]?\d+(?:\.\d+)?)(?:\s*[,;]\s*|\s+)([+-]?\d+(?:\.\d+)?)\s*$",
-        location_str,
+    parts = re.split(r"[,;\s]+", location_str.strip())
+    coord_match = len(parts) == 2 and all(
+        re.fullmatch(r"[+-]?\d+(?:\.\d+)?", p) for p in parts
     )
     if coord_match:
-        lat = float(coord_match.group(1))
-        lon = float(coord_match.group(2))
+        lat = float(parts[0])
+        lon = float(parts[1])
         country_code = "FR"
         try:
             r = requests.get(
@@ -187,7 +190,10 @@ def resolve_location(location_str: str) -> tuple[float, float, str, str]:
                     r.json().get("address", {}).get("country_code", "FR").upper()
                 )
         except (OSError, ValueError) as exc:
-            print(f"Warning: reverse geocoding failed ({exc}). Defaulting to FR.", file=sys.stderr)
+            print(
+                f"Warning: reverse geocoding failed ({exc}). Defaulting to FR.",
+                file=sys.stderr,
+            )
         return lat, lon, f"{lat:.4f}, {lon:.4f}", country_code
 
     params = {"q": location_str, "format": "json", "addressdetails": 1, "limit": 1}
@@ -234,6 +240,20 @@ def parse_vertical_limit(limit_obj: dict[str, Any] | None) -> tuple[float, str, 
     return round(meters, 1), label, is_agl
 
 
+def _is_h24_schedule(oh: Any) -> bool:
+    """Return True if operating hours represent a permanent H24 schedule."""
+    if isinstance(oh, str):
+        return oh.upper() == "H24"
+    if isinstance(oh, list) and oh:
+        return len(oh) == 7 and all(
+            d.get("startTime") == "00:00"
+            and d.get("endTime") == "00:00"
+            and not d.get("byNotam")
+            for d in oh
+        )
+    return True
+
+
 def is_activatable_airspace(airspace: dict[str, Any]) -> bool:
     """Detect whether an airspace is conditional/activatable rather than permanent H24."""
     if airspace.get("byNotam") or airspace.get("onDemand") or airspace.get("onRequest"):
@@ -242,17 +262,7 @@ def is_activatable_airspace(airspace: dict[str, Any]) -> bool:
     hours = airspace.get("hoursOfOperation")
     if isinstance(hours, dict):
         oh = hours.get("operatingHours")
-        if isinstance(oh, list) and oh:
-            # An airspace is H24 if all 7 days of the week are 00:00-00:00 without NOTAM
-            is_h24 = len(oh) == 7 and all(
-                d.get("startTime") == "00:00"
-                and d.get("endTime") == "00:00"
-                and not d.get("byNotam")
-                for d in oh
-            )
-            if not is_h24:
-                return True
-        elif isinstance(oh, str) and oh.upper() != "H24":
+        if not _is_h24_schedule(oh):
             return True
 
     text_blob = " ".join(
@@ -260,6 +270,19 @@ def is_activatable_airspace(airspace: dict[str, Any]) -> bool:
     ).upper()
     conditional_keywords = ("HX", "NOTAM", "ACTIVABLE", "SUP AIP", "AZBA", "BY NOTAM")
     return any(kw in text_blob for kw in conditional_keywords)
+
+
+def _classify_controlled(
+    airspace: dict[str, Any], asp_type: str, icao_class: str
+) -> str:
+    """Return RED or ORANGE for controlled/restricted airspace types."""
+    if is_activatable_airspace(airspace):
+        return "ORANGE"
+    if asp_type in ("TMA", "CTA", "MTMA"):
+        return "RED" if icao_class in ("A", "B", "C", "D") else "ORANGE"
+    if icao_class in ("A", "B", "C", "D") or asp_type in ("P", "CTR"):
+        return "RED"
+    return "ORANGE"
 
 
 def classify_airspace(
@@ -273,16 +296,12 @@ def classify_airspace(
 
     if asp_type in ("FIR", "UIR", "ACC", "ADIZ"):
         return None
-
     if asp_type == "OTHER" and not include_other:
         return None
-
     if excluded_types and asp_type in excluded_types:
         return None
-
     if icao_class == "E":
         return "BLUE"
-
     if asp_type in (
         "RMZ",
         "TMZ",
@@ -295,24 +314,9 @@ def classify_airspace(
         "SPORT",
     ):
         return "YELLOW"
-
     if asp_type in ("R", "D", "TRA", "TSA", "MTR", "ALERT", "WARNING", "PROTECTED"):
         return "ORANGE"
-
-    if asp_type in ("P", "CTR"):
-        return "ORANGE" if is_activatable_airspace(airspace) else "RED"
-
-    if asp_type in ("TMA", "CTA", "MTMA"):
-        if is_activatable_airspace(airspace):
-            return "ORANGE"
-        if icao_class in ("A", "B", "C", "D"):
-            return "RED"
-        return "ORANGE"
-
-    if icao_class in ("A", "B", "C", "D"):
-        return "ORANGE" if is_activatable_airspace(airspace) else "RED"
-
-    return "ORANGE"
+    return _classify_controlled(airspace, asp_type, icao_class)
 
 
 def point_in_polygon(lon: float, lat: float, ring: list[tuple[float, float]]) -> bool:
@@ -379,7 +383,10 @@ def fetch_openaip_airspaces(
                 )
                 continue
             except (OSError, ValueError) as exc:
-                print(f"Warning: could not read cache file {c_file} ({exc}), re-fetching.", file=sys.stderr)
+                print(
+                    f"Warning: could not read cache file {c_file} ({exc}), re-fetching.",
+                    file=sys.stderr,
+                )
 
         print(f"Fetching airspaces for country {c_code} from OpenAIP API...")
         country_items: list[dict[str, Any]] = []
@@ -425,7 +432,10 @@ def fetch_openaip_airspaces(
         try:
             c_file.write_text(json.dumps(country_items), encoding="utf-8")
         except OSError as exc:
-            print(f"Warning: could not write cache file {c_file} ({exc}).", file=sys.stderr)
+            print(
+                f"Warning: could not write cache file {c_file} ({exc}).",
+                file=sys.stderr,
+            )
 
         print(f"Fetched {len(country_items)} airspaces for country {c_code}.")
         all_country_airspaces.extend(country_items)
@@ -590,6 +600,170 @@ def format_amsl_range(values: list[float]) -> str:
     return f"{lo} m AMSL" if abs(hi - lo) <= 5 else f"~{lo}-{hi} m AMSL"
 
 
+def _build_reference_folder(
+    doc: ET.Element,
+    center_lat: float,
+    center_lon: float,
+    location_label: str,
+    radius_km: float,
+    max_altitude_m: float,
+    center_elev: float,
+) -> None:
+    """Append the central marker and radius ring folder to the KML document."""
+    ref_folder = ET.SubElement(doc, "Folder")
+    ET.SubElement(ref_folder, "name").text = "0. Repere Central & Rayon"
+
+    center_pm = ET.SubElement(ref_folder, "Placemark")
+    ET.SubElement(center_pm, "name").text = f"Point Central : {location_label}"
+    ET.SubElement(center_pm, "description").text = (
+        f"Coordonnees : {center_lat:.5f}, {center_lon:.5f}<br>"
+        f"Altitude terrain (DEM) : {round(center_elev)} m AMSL<br>"
+        f"Rayon de recherche : {radius_km:g} km<br>"
+        f"Plafond visuel : {int(max_altitude_m)} m AMSL"
+    )
+    pt = ET.SubElement(center_pm, "Point")
+    ET.SubElement(pt, "altitudeMode").text = "clampToGround"
+    ET.SubElement(pt, "coordinates").text = f"{center_lon},{center_lat},0"
+
+    radius_pm = ET.SubElement(ref_folder, "Placemark")
+    ET.SubElement(radius_pm, "name").text = f"Cercle Rayon ({radius_km:g} km)"
+    ring_style = ET.SubElement(radius_pm, "Style")
+    ring_line = ET.SubElement(ring_style, "LineStyle")
+    ET.SubElement(ring_line, "color").text = kml_color(75, "#FFFFFF")
+    ET.SubElement(ring_line, "width").text = "2.0"
+    line_string = ET.SubElement(radius_pm, "LineString")
+    ET.SubElement(line_string, "tessellate").text = "1"
+    ET.SubElement(line_string, "altitudeMode").text = "clampToGround"
+    ET.SubElement(line_string, "coordinates").text = " ".join(
+        f"{lon},{lat},0"
+        for lon, lat in generate_circle_coords(center_lat, center_lon, radius_km)
+    )
+
+
+_RingData = tuple[list[tuple[float, float]], list[float], list[float]]
+
+
+def _resolve_ring_altitudes(
+    raw_ring: list[tuple[float, float]],
+    floor_val_m: float,
+    floor_is_agl: bool,
+    ceil_val_m: float,
+    ceil_is_agl: bool,
+    max_altitude_m: float,
+    elevation_resolver: ElevationResolver,
+    needs_terrain: bool,
+) -> tuple[list[tuple[float, float]], list[float], list[float], list[float]] | None:
+    """Resolve AMSL altitudes for one ring; returns (ring, floor_amsls, visual_ceil_amsls, raw_ceil_amsls) or None if filtered."""
+    ring = densify_ring(raw_ring, max_segment_km=1.5) if needs_terrain else raw_ring
+    if ring[0] != ring[-1]:
+        ring = ring + [ring[0]]
+
+    terrains = (
+        elevation_resolver.get_elevations(ring) if needs_terrain else [0.0] * len(ring)
+    )
+
+    if floor_is_agl:
+        floor_amsls = (
+            [t + floor_val_m for t in terrains]
+            if floor_val_m > 0
+            else [0.0] * len(ring)
+        )
+    else:
+        floor_amsls = [floor_val_m] * len(ring)
+
+    raw_ceil_amsls = (
+        [t + ceil_val_m for t in terrains] if ceil_is_agl else [ceil_val_m] * len(ring)
+    )
+    visual_ceil_amsls = [min(c, max_altitude_m) for c in raw_ceil_amsls]
+
+    if min(floor_amsls) >= max_altitude_m or max(visual_ceil_amsls) <= min(floor_amsls):
+        return None
+    return ring, floor_amsls, visual_ceil_amsls, raw_ceil_amsls
+
+
+def _collect_resolved_rings(
+    raw_rings: list[list[tuple[float, float]]],
+    floor_val_m: float,
+    floor_is_agl: bool,
+    ceil_val_m: float,
+    ceil_is_agl: bool,
+    max_altitude_m: float,
+    elevation_resolver: ElevationResolver,
+) -> tuple[list[_RingData], list[float], list[float]]:
+    """Resolve all rings for one airspace; returns (resolved_rings_data, all_floors_amsl, all_raw_ceils_amsl)."""
+    needs_terrain = (floor_is_agl and floor_val_m > 0) or ceil_is_agl
+    resolved: list[_RingData] = []
+    all_floors: list[float] = []
+    all_ceils: list[float] = []
+    for raw_ring in raw_rings:
+        result = _resolve_ring_altitudes(
+            raw_ring,
+            floor_val_m,
+            floor_is_agl,
+            ceil_val_m,
+            ceil_is_agl,
+            max_altitude_m,
+            elevation_resolver,
+            needs_terrain,
+        )
+        if result is None:
+            continue
+        ring, floor_amsls, visual_ceil_amsls, raw_ceil_amsls = result
+        resolved.append((ring, floor_amsls, visual_ceil_amsls))
+        all_floors.extend(floor_amsls)
+        all_ceils.extend(raw_ceil_amsls)
+    return resolved, all_floors, all_ceils
+
+
+def _build_airspace_placemark(
+    folder: ET.Element,
+    asp: dict[str, Any],
+    category: str,
+    icao_class: str,
+    floor_val_m: float,
+    floor_label: str,
+    floor_is_agl: bool,
+    ceil_label: str,
+    max_altitude_m: float,
+    all_floors_amsl: list[float],
+    all_raw_ceils_amsl: list[float],
+    resolved_rings_data: list[
+        tuple[list[tuple[float, float]], list[float], list[float]]
+    ],
+) -> None:
+    """Append a KML Placemark with 3D geometry for one airspace into its category folder."""
+    asp_name = asp.get("name", "Unnamed Airspace")
+    asp_type = AIRSPACE_TYPE_MAP.get(asp.get("type", 0), "OTHER")
+    remarks = asp.get("remarks", "")
+    floor_amsl_info = (
+        "Sol (SFC)"
+        if (floor_is_agl and floor_val_m == 0)
+        else format_amsl_range(all_floors_amsl)
+    )
+
+    pm = ET.SubElement(folder, "Placemark")
+    ET.SubElement(pm, "name").text = f"{asp_name} [{floor_label} - {ceil_label}]"
+    ET.SubElement(pm, "description").text = (
+        f"<b>Type :</b> {asp_type} | <b>Classe :</b> {icao_class}<br>"
+        f"<b>Plancher :</b> {floor_label} ({floor_amsl_info})<br>"
+        f"<b>Plafond reel :</b> {ceil_label} ({format_amsl_range(all_raw_ceils_amsl)})<br>"
+        f"<b>Plafond affiche :</b> max {int(max_altitude_m)} m AMSL<br>"
+        f"{f'<br><i>{remarks}</i>' if remarks else ''}"
+    )
+    ET.SubElement(pm, "styleUrl").text = f"#style_{category}"
+
+    draw_floor_face = not (floor_is_agl and floor_val_m == 0)
+    multi_geo = ET.SubElement(pm, "MultiGeometry")
+    for ring, floor_amsls, visual_ceil_amsls in resolved_rings_data:
+        add_3d_volume_to_multigeometry(
+            multi_geo=multi_geo,
+            ring=ring,
+            floor_amsls=floor_amsls,
+            ceil_amsls=visual_ceil_amsls,
+            draw_floor_face=draw_floor_face,
+        )
+
+
 def build_kml(
     airspaces: list[dict[str, Any]],
     center_lat: float,
@@ -615,40 +789,19 @@ def build_kml(
         line_style = ET.SubElement(style, "LineStyle")
         ET.SubElement(line_style, "color").text = kml_color(85, cat_info["hex"])
         ET.SubElement(line_style, "width").text = "1.5"
-
         poly_style = ET.SubElement(style, "PolyStyle")
         ET.SubElement(poly_style, "color").text = kml_color(25, cat_info["hex"])
         ET.SubElement(poly_style, "outline").text = "1"
 
-    # Reference folder: central marker + ground search radius ring
-    ref_folder = ET.SubElement(doc, "Folder")
-    ET.SubElement(ref_folder, "name").text = "0. Repere Central & Rayon"
-
     center_elev = elevation_resolver.get_single(center_lon, center_lat)
-    center_pm = ET.SubElement(ref_folder, "Placemark")
-    ET.SubElement(center_pm, "name").text = f"Point Central : {location_label}"
-    ET.SubElement(center_pm, "description").text = (
-        f"Coordonnees : {center_lat:.5f}, {center_lon:.5f}<br>"
-        f"Altitude terrain (DEM) : {round(center_elev)} m AMSL<br>"
-        f"Rayon de recherche : {radius_km:g} km<br>"
-        f"Plafond visuel : {int(max_altitude_m)} m AMSL"
-    )
-    pt = ET.SubElement(center_pm, "Point")
-    ET.SubElement(pt, "altitudeMode").text = "clampToGround"
-    ET.SubElement(pt, "coordinates").text = f"{center_lon},{center_lat},0"
-
-    radius_pm = ET.SubElement(ref_folder, "Placemark")
-    ET.SubElement(radius_pm, "name").text = f"Cercle Rayon ({radius_km:g} km)"
-    ring_style = ET.SubElement(radius_pm, "Style")
-    ring_line = ET.SubElement(ring_style, "LineStyle")
-    ET.SubElement(ring_line, "color").text = kml_color(75, "#FFFFFF")
-    ET.SubElement(ring_line, "width").text = "2.0"
-    line_string = ET.SubElement(radius_pm, "LineString")
-    ET.SubElement(line_string, "tessellate").text = "1"
-    ET.SubElement(line_string, "altitudeMode").text = "clampToGround"
-    circle_coords = generate_circle_coords(center_lat, center_lon, radius_km)
-    ET.SubElement(line_string, "coordinates").text = " ".join(
-        f"{lon},{lat},0" for lon, lat in circle_coords
+    _build_reference_folder(
+        doc,
+        center_lat,
+        center_lon,
+        location_label,
+        radius_km,
+        max_altitude_m,
+        center_elev,
     )
 
     category_folders: dict[str, ET.Element] = {}
@@ -662,7 +815,6 @@ def build_kml(
         icao_class = ICAO_CLASS_MAP.get(asp.get("icaoClass", 8), "SUA")
         if icao_class in excluded_classes:
             continue
-
         category = classify_airspace(
             asp, include_other=include_other, excluded_types=excluded_types
         )
@@ -675,94 +827,38 @@ def build_kml(
         ceil_val_m, ceil_label, ceil_is_agl = parse_vertical_limit(
             asp.get("upperLimit")
         )
-
         raw_rings = extract_polygon_rings(asp.get("geometry", {}))
         if not raw_rings:
             continue
 
-        needs_terrain = (floor_is_agl and floor_val_m > 0) or ceil_is_agl
-        resolved_rings_data: list[
-            tuple[list[tuple[float, float]], list[float], list[float]]
-        ] = []
-        all_floors_amsl: list[float] = []
-        all_raw_ceils_amsl: list[float] = []
-
-        for raw_ring in raw_rings:
-            ring = (
-                densify_ring(raw_ring, max_segment_km=1.5)
-                if needs_terrain
-                else raw_ring
+        resolved_rings_data, all_floors_amsl, all_raw_ceils_amsl = (
+            _collect_resolved_rings(
+                raw_rings,
+                floor_val_m,
+                floor_is_agl,
+                ceil_val_m,
+                ceil_is_agl,
+                max_altitude_m,
+                elevation_resolver,
             )
-            if ring[0] != ring[-1]:
-                ring = ring + [ring[0]]
-
-            if needs_terrain:
-                terrains = elevation_resolver.get_elevations(ring)
-            else:
-                terrains = [0.0] * len(ring)
-
-            if floor_is_agl:
-                if floor_val_m > 0:
-                    floor_amsls = [t + floor_val_m for t in terrains]
-                else:
-                    # Grounded (0 ft GND / SFC): anchor at 0 m MSL (underground)
-                    floor_amsls = [0.0] * len(ring)
-            else:
-                floor_amsls = [floor_val_m] * len(ring)
-
-            if ceil_is_agl:
-                raw_ceil_amsls = [t + ceil_val_m for t in terrains]
-            else:
-                raw_ceil_amsls = [ceil_val_m] * len(ring)
-
-            visual_ceil_amsls = [min(c, max_altitude_m) for c in raw_ceil_amsls]
-
-            # Keep ring only if at least part of the volume is below max_altitude_m
-            if min(floor_amsls) >= max_altitude_m or max(visual_ceil_amsls) <= min(
-                floor_amsls
-            ):
-                continue
-
-            resolved_rings_data.append((ring, floor_amsls, visual_ceil_amsls))
-            all_floors_amsl.extend(floor_amsls)
-            all_raw_ceils_amsl.extend(raw_ceil_amsls)
-
+        )
         if not resolved_rings_data:
             continue
 
-        asp_name = asp.get("name", "Unnamed Airspace")
-        asp_type = AIRSPACE_TYPE_MAP.get(asp.get("type", 0), "OTHER")
-        remarks = asp.get("remarks", "")
-
-        floor_amsl_info = (
-            "Sol (SFC)"
-            if (floor_is_agl and floor_val_m == 0)
-            else format_amsl_range(all_floors_amsl)
+        _build_airspace_placemark(
+            folder=category_folders[category],
+            asp=asp,
+            category=category,
+            icao_class=icao_class,
+            floor_val_m=floor_val_m,
+            floor_label=floor_label,
+            floor_is_agl=floor_is_agl,
+            ceil_label=ceil_label,
+            max_altitude_m=max_altitude_m,
+            all_floors_amsl=all_floors_amsl,
+            all_raw_ceils_amsl=all_raw_ceils_amsl,
+            resolved_rings_data=resolved_rings_data,
         )
-        ceil_amsl_info = format_amsl_range(all_raw_ceils_amsl)
-
-        pm = ET.SubElement(category_folders[category], "Placemark")
-        ET.SubElement(pm, "name").text = f"{asp_name} [{floor_label} - {ceil_label}]"
-        ET.SubElement(pm, "description").text = (
-            f"<b>Type :</b> {asp_type} | <b>Classe :</b> {icao_class}<br>"
-            f"<b>Plancher :</b> {floor_label} ({floor_amsl_info})<br>"
-            f"<b>Plafond reel :</b> {ceil_label} ({ceil_amsl_info})<br>"
-            f"<b>Plafond affiche :</b> max {int(max_altitude_m)} m AMSL<br>"
-            f"{f'<br><i>{remarks}</i>' if remarks else ''}"
-        )
-        ET.SubElement(pm, "styleUrl").text = f"#style_{category}"
-
-        draw_floor_face = not (floor_is_agl and floor_val_m == 0)
-        multi_geo = ET.SubElement(pm, "MultiGeometry")
-        for ring, floor_amsls, visual_ceil_amsls in resolved_rings_data:
-            add_3d_volume_to_multigeometry(
-                multi_geo=multi_geo,
-                ring=ring,
-                floor_amsls=floor_amsls,
-                ceil_amsls=visual_ceil_amsls,
-                draw_floor_face=draw_floor_face,
-            )
-
         exported_count += 1
 
     # Remove empty folders so the KML tree stays clean
