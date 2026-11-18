@@ -1,7 +1,12 @@
 [tool.pyright]
 include = ["airspace", "generate_airspace_kml.py", "tests"]
-extraPaths = ["."]
+extraPaths = ["src"]
 venvPath = "."
 venv = ".venv"
 typeCheckingMode = "basic"
 reportMissingTypeStubs = false
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+main_file = "src/generate_airspace_kml.py"

@@ -7,7 +7,6 @@ import argparse
 import os
 import re
 import sys
-from typing import Any
 
 from airspace.api import (
     fetch_openaip_airspaces,
@@ -54,12 +53,12 @@ from airspace.kml import (
 __all__ = [
     "AIRSPACE_TYPE_MAP",
     "CATEGORY_STYLES",
-    "ElevationResolver",
     "HAVE_CURL_CFFI",
     "ICAO_CLASS_MAP",
     "NOMINATIM_SEARCH_URL",
     "OPENAIP_AIRSPACES_URL",
     "OPEN_METEO_ELEVATION_URL",
+    "ElevationResolver",
     "_build_airspace_placemark",
     "_build_reference_folder",
     "_classify_controlled",
