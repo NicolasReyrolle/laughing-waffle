@@ -198,7 +198,7 @@ def resolve_location(location_str: str) -> tuple[float, float, str, str]:
             )
         return lat, lon, f"{lat:.4f}, {lon:.4f}", country_code
 
-    params = {"q": location_str, "format": "json", "addressdetails": 1, "limit": 1}
+    params: dict[str, str | int] = {"q": location_str, "format": "json", "addressdetails": 1, "limit": 1}
     response = requests.get(
         NOMINATIM_SEARCH_URL, params=params, headers=headers, timeout=15
     )
