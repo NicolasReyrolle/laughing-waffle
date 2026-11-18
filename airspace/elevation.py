@@ -1,7 +1,11 @@
 """Terrain elevation resolution via Open-Meteo DEM API with batching and caching."""
 
 import sys
+from typing import Any
+
 from airspace.constants import OPEN_METEO_ELEVATION_URL, requests
+
+__all__ = ["ElevationResolver"]
 
 
 class ElevationResolver:
@@ -36,8 +40,9 @@ class ElevationResolver:
                 timeout=15,
             )
             resp.raise_for_status()
-            elevations = resp.json().get("elevation", [])
-            if len(elevations) != len(chunk):
+            data: Any = resp.json()
+            elevations = data.get("elevation", []) if isinstance(data, dict) else []
+            if not isinstance(elevations, list) or len(elevations) != len(chunk):
                 raise ValueError("Unexpected elevation array length from DEM API.")
             for key, elev in zip(chunk, elevations):
                 self._cache[key] = float(elev) if elev is not None else 0.0

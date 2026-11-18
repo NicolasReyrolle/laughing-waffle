@@ -1,7 +1,16 @@
 """Classification and parsing of OpenAIP airspace types, classes, and limits."""
 
 from typing import Any
+
 from airspace.constants import AIRSPACE_TYPE_MAP, ICAO_CLASS_MAP
+
+__all__ = [
+    "_classify_controlled",
+    "_is_h24_schedule",
+    "classify_airspace",
+    "is_activatable_airspace",
+    "parse_vertical_limit",
+]
 
 
 def parse_vertical_limit(limit_obj: dict[str, Any] | None) -> tuple[float, str, bool]:

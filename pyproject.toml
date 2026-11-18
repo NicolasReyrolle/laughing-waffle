@@ -1,0 +1,7 @@
+[tool.pyright]
+include = ["airspace", "generate_airspace_kml.py", "tests"]
+extraPaths = ["."]
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "basic"
+reportMissingTypeStubs = false

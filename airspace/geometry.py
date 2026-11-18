@@ -3,6 +3,15 @@
 import math
 from typing import Any
 
+__all__ = [
+    "densify_ring",
+    "extract_polygon_rings",
+    "generate_circle_coords",
+    "haversine_km",
+    "is_airspace_in_radius",
+    "point_in_polygon",
+]
+
 
 def point_in_polygon(lon: float, lat: float, ring: list[tuple[float, float]]) -> bool:
     """Test if a coordinate point is inside a polygon ring using ray-casting.

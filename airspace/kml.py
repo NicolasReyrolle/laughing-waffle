@@ -8,7 +8,27 @@ from xml.dom import minidom
 from airspace.classification import classify_airspace, parse_vertical_limit
 from airspace.constants import AIRSPACE_TYPE_MAP, CATEGORY_STYLES, ICAO_CLASS_MAP
 from airspace.elevation import ElevationResolver
-from airspace.geometry import densify_ring, extract_polygon_rings, generate_circle_coords
+from airspace.geometry import (
+    densify_ring,
+    extract_polygon_rings,
+    generate_circle_coords,
+)
+
+__all__ = [
+    "_build_airspace_placemark",
+    "_build_reference_folder",
+    "_clean_empty_folders",
+    "_collect_resolved_rings",
+    "_create_category_folders",
+    "_export_single_airspace",
+    "_init_kml_document",
+    "_resolve_ring_altitudes",
+    "_write_kml_file",
+    "add_3d_volume_to_multigeometry",
+    "build_kml",
+    "format_amsl_range",
+    "kml_color",
+]
 
 
 def kml_color(alpha_percent: int, hex_rgb: str) -> str:
@@ -340,6 +360,158 @@ def _build_airspace_placemark(
         )
 
 
+def _init_kml_document(
+    location_label: str, radius_km: float, max_altitude_m: float
+) -> tuple[ET.Element, ET.Element]:
+    """Initialize the KML root element and define style entries for categories.
+
+    Args:
+        location_label: Human-readable name or label of the center location.
+        radius_km: Search radius in kilometers.
+        max_altitude_m: Maximum visual altitude cap in meters AMSL.
+
+    Returns:
+        Tuple of (kml_root, document_element).
+    """
+    kml = ET.Element("kml", xmlns="http://www.opengis.net/kml/2.2")
+    doc = ET.SubElement(kml, "Document")
+    ET.SubElement(doc, "name").text = (
+        f"Espaces Aeriens 3D - {location_label} ({radius_km:g} km / max {int(max_altitude_m)} m)"
+    )
+
+    for cat_key, cat_info in CATEGORY_STYLES.items():
+        style = ET.SubElement(doc, "Style", id=f"style_{cat_key}")
+        line_style = ET.SubElement(style, "LineStyle")
+        ET.SubElement(line_style, "color").text = kml_color(85, cat_info["hex"])
+        ET.SubElement(line_style, "width").text = "1.5"
+        poly_style = ET.SubElement(style, "PolyStyle")
+        ET.SubElement(poly_style, "color").text = kml_color(25, cat_info["hex"])
+        ET.SubElement(poly_style, "outline").text = "1"
+
+    return kml, doc
+
+
+def _create_category_folders(doc: ET.Element) -> dict[str, ET.Element]:
+    """Create category folders inside the KML document.
+
+    Args:
+        doc: KML Document XML element.
+
+    Returns:
+        Dictionary mapping category key to its corresponding Folder element.
+    """
+    category_folders: dict[str, ET.Element] = {}
+    for cat_key, cat_info in CATEGORY_STYLES.items():
+        folder = ET.SubElement(doc, "Folder")
+        ET.SubElement(folder, "name").text = cat_info["folder"]
+        category_folders[cat_key] = folder
+    return category_folders
+
+
+def _export_single_airspace(
+    asp: dict[str, Any],
+    excluded_classes: set[str],
+    include_other: bool,
+    excluded_types: set[str] | None,
+    max_altitude_m: float,
+    elevation_resolver: ElevationResolver,
+    category_folders: dict[str, ET.Element],
+) -> bool:
+    """Filter, resolve altitudes, and add a single airspace Placemark to its category folder.
+
+    Args:
+        asp: OpenAIP airspace dictionary.
+        excluded_classes: Set of uppercase ICAO class codes to omit.
+        include_other: Whether to include airspaces with type 'OTHER'.
+        excluded_types: Optional set of uppercase airspace types to omit.
+        max_altitude_m: Maximum visual altitude cap in meters AMSL.
+        elevation_resolver: ElevationResolver instance for DEM terrain lookup.
+        category_folders: Mapping of category key to Folder element.
+
+    Returns:
+        True if the airspace volume was exported into a folder, False otherwise.
+    """
+    icao_class = ICAO_CLASS_MAP.get(asp.get("icaoClass", 8), "SUA")
+    if icao_class in excluded_classes:
+        return False
+    category = classify_airspace(
+        asp, include_other=include_other, excluded_types=excluded_types
+    )
+    if not category:
+        return False
+
+    raw_rings = extract_polygon_rings(asp.get("geometry", {}))
+    if not raw_rings:
+        return False
+
+    floor_val_m, floor_label, floor_is_agl = parse_vertical_limit(
+        asp.get("lowerLimit")
+    )
+    ceil_val_m, ceil_label, ceil_is_agl = parse_vertical_limit(
+        asp.get("upperLimit")
+    )
+
+    resolved_rings_data, all_floors_amsl, all_raw_ceils_amsl = (
+        _collect_resolved_rings(
+            raw_rings,
+            floor_val_m,
+            floor_is_agl,
+            ceil_val_m,
+            ceil_is_agl,
+            max_altitude_m,
+            elevation_resolver,
+        )
+    )
+    if not resolved_rings_data:
+        return False
+
+    _build_airspace_placemark(
+        folder=category_folders[category],
+        asp=asp,
+        category=category,
+        icao_class=icao_class,
+        floor_val_m=floor_val_m,
+        floor_label=floor_label,
+        floor_is_agl=floor_is_agl,
+        ceil_label=ceil_label,
+        max_altitude_m=max_altitude_m,
+        all_floors_amsl=all_floors_amsl,
+        all_raw_ceils_amsl=all_raw_ceils_amsl,
+        resolved_rings_data=resolved_rings_data,
+    )
+    return True
+
+
+def _clean_empty_folders(
+    doc: ET.Element, category_folders: dict[str, ET.Element]
+) -> None:
+    """Remove empty category folders from the document to keep the KML tree clean.
+
+    Args:
+        doc: KML Document XML element.
+        category_folders: Dictionary mapping category key to Folder element.
+    """
+    for folder in category_folders.values():
+        if folder.find("Placemark") is None:
+            doc.remove(folder)
+
+
+def _write_kml_file(kml: ET.Element, output_path: str) -> None:
+    """Format and write the KML XML element tree to disk.
+
+    Args:
+        kml: Root KML XML element.
+        output_path: File system path where the KML file should be written.
+    """
+    pretty_xml: Any = minidom.parseString(
+        ET.tostring(kml, encoding="utf-8")
+    ).toprettyxml(indent="  ", encoding="utf-8")
+    if isinstance(pretty_xml, bytes):
+        Path(output_path).write_bytes(pretty_xml)
+    else:
+        Path(output_path).write_text(str(pretty_xml), encoding="utf-8")
+
+
 def build_kml(
     airspaces: list[dict[str, Any]],
     center_lat: float,
@@ -374,21 +546,7 @@ def build_kml(
     Returns:
         Total number of 3D airspace volumes exported into the KML file.
     """
-    kml = ET.Element("kml", xmlns="http://www.opengis.net/kml/2.2")
-    doc = ET.SubElement(kml, "Document")
-    ET.SubElement(doc, "name").text = (
-        f"Espaces Aeriens 3D - {location_label} ({radius_km:g} km / max {int(max_altitude_m)} m)"
-    )
-
-    for cat_key, cat_info in CATEGORY_STYLES.items():
-        style = ET.SubElement(doc, "Style", id=f"style_{cat_key}")
-        line_style = ET.SubElement(style, "LineStyle")
-        ET.SubElement(line_style, "color").text = kml_color(85, cat_info["hex"])
-        ET.SubElement(line_style, "width").text = "1.5"
-        poly_style = ET.SubElement(style, "PolyStyle")
-        ET.SubElement(poly_style, "color").text = kml_color(25, cat_info["hex"])
-        ET.SubElement(poly_style, "outline").text = "1"
-
+    kml, doc = _init_kml_document(location_label, radius_km, max_altitude_m)
     center_elev = elevation_resolver.get_single(center_lon, center_lat)
     _build_reference_folder(
         doc,
@@ -399,71 +557,22 @@ def build_kml(
         max_altitude_m,
         center_elev,
     )
+    category_folders = _create_category_folders(doc)
 
-    category_folders: dict[str, ET.Element] = {}
-    for cat_key, cat_info in CATEGORY_STYLES.items():
-        folder = ET.SubElement(doc, "Folder")
-        ET.SubElement(folder, "name").text = cat_info["folder"]
-        category_folders[cat_key] = folder
-
-    exported_count = 0
-    for asp in airspaces:
-        icao_class = ICAO_CLASS_MAP.get(asp.get("icaoClass", 8), "SUA")
-        if icao_class in excluded_classes:
-            continue
-        category = classify_airspace(
-            asp, include_other=include_other, excluded_types=excluded_types
-        )
-        if not category:
-            continue
-
-        floor_val_m, floor_label, floor_is_agl = parse_vertical_limit(
-            asp.get("lowerLimit")
-        )
-        ceil_val_m, ceil_label, ceil_is_agl = parse_vertical_limit(
-            asp.get("upperLimit")
-        )
-        raw_rings = extract_polygon_rings(asp.get("geometry", {}))
-        if not raw_rings:
-            continue
-
-        resolved_rings_data, all_floors_amsl, all_raw_ceils_amsl = (
-            _collect_resolved_rings(
-                raw_rings,
-                floor_val_m,
-                floor_is_agl,
-                ceil_val_m,
-                ceil_is_agl,
-                max_altitude_m,
-                elevation_resolver,
-            )
-        )
-        if not resolved_rings_data:
-            continue
-
-        _build_airspace_placemark(
-            folder=category_folders[category],
+    exported_count = sum(
+        1
+        for asp in airspaces
+        if _export_single_airspace(
             asp=asp,
-            category=category,
-            icao_class=icao_class,
-            floor_val_m=floor_val_m,
-            floor_label=floor_label,
-            floor_is_agl=floor_is_agl,
-            ceil_label=ceil_label,
+            excluded_classes=excluded_classes,
+            include_other=include_other,
+            excluded_types=excluded_types,
             max_altitude_m=max_altitude_m,
-            all_floors_amsl=all_floors_amsl,
-            all_raw_ceils_amsl=all_raw_ceils_amsl,
-            resolved_rings_data=resolved_rings_data,
+            elevation_resolver=elevation_resolver,
+            category_folders=category_folders,
         )
-        exported_count += 1
-
-    # Remove empty folders so the KML tree stays clean
-    for folder in category_folders.values():
-        if folder.find("Placemark") is None:
-            doc.remove(folder)
-
-    pretty_xml = minidom.parseString(ET.tostring(kml, encoding="utf-8")).toprettyxml(
-        indent="  ", encoding="utf-8"
     )
-    Path(output_path).write_bytes(pretty_xml)
+
+    _clean_empty_folders(doc, category_folders)
+    _write_kml_file(kml, output_path)
     return exported_count

@@ -2,13 +2,15 @@
 
 from typing import Any
 
-try:
-    from curl_cffi import requests  # type: ignore[no-redef]
+import requests as _requests
 
+try:
+    from curl_cffi import requests as _curl_requests  # type: ignore[import-untyped,import-not-found]
+
+    requests: Any = _curl_requests
     _curl_cffi_available = True
 except ImportError:
-    import requests  # type: ignore[no-redef]
-
+    requests: Any = _requests  # type: ignore[no-redef]
     _curl_cffi_available = False
 
 HAVE_CURL_CFFI: bool = _curl_cffi_available
@@ -82,3 +84,14 @@ CATEGORY_STYLES: dict[str, dict[str, str]] = {
         "hex": "#1E88E5",
     },
 }
+
+__all__ = [
+    "AIRSPACE_TYPE_MAP",
+    "CATEGORY_STYLES",
+    "HAVE_CURL_CFFI",
+    "ICAO_CLASS_MAP",
+    "NOMINATIM_SEARCH_URL",
+    "OPENAIP_AIRSPACES_URL",
+    "OPEN_METEO_ELEVATION_URL",
+    "requests",
+]
